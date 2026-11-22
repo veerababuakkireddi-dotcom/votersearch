@@ -24,7 +24,9 @@ import java.io.File
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.Callable
 import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
 import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity() {
@@ -108,7 +110,8 @@ class MainActivity : AppCompatActivity() {
         status.text = "Copying PDF. Keep the app open…"
 
         worker.execute {
-            var ocr: TessBaseAPI? = null
+            val engines = mutableListOf<TessBaseAPI>()
+            var pool: java.util.concurrent.ExecutorService? = null
             var pfd: ParcelFileDescriptor? = null
             var renderer: PdfRenderer? = null
             var completed = false
@@ -131,22 +134,30 @@ class MainActivity : AppCompatActivity() {
                 updateStatus("Downloading / checking Telugu OCR data…")
                 downloadLanguageData(tessData, "tel")
 
-                // tess-two expects the parent of the tessdata directory.
-                updateStatus("Initializing English + Telugu OCR engine…")
-                val engine = TessBaseAPI()
-                ocr = engine
-                // tessdata_fast files are LSTM-only, so the engine mode must be LSTM_ONLY.
-                val initialized = engine.init(
-                    tessRoot.absolutePath,
-                    "eng+tel",
-                    TessBaseAPI.OEM_LSTM_ONLY
-                )
-                if (!initialized) {
-                    // Delete the language files so the next import downloads fresh copies.
-                    File(tessData, "eng.traineddata").delete()
-                    File(tessData, "tel.traineddata").delete()
-                    error("Tesseract could not initialize eng+tel. The OCR data was reset; please try the import again.")
+                // One OCR engine per thread; OCR of the 27 cards on a page runs in parallel.
+                val threads = (Runtime.getRuntime().availableProcessors() - 1).coerceIn(2, 4)
+                updateStatus("Initializing English + Telugu OCR engine ($threads threads)…")
+                val idle = LinkedBlockingQueue<TessBaseAPI>()
+                for (i in 0 until threads) {
+                    val engine = TessBaseAPI()
+                    engines.add(engine)
+                    // tessdata_fast files are LSTM-only, so the engine mode must be LSTM_ONLY.
+                    val initialized = engine.init(
+                        tessRoot.absolutePath,
+                        "eng+tel",
+                        TessBaseAPI.OEM_LSTM_ONLY
+                    )
+                    if (!initialized) {
+                        // Delete the language files so the next import downloads fresh copies.
+                        File(tessData, "eng.traineddata").delete()
+                        File(tessData, "tel.traineddata").delete()
+                        error("Tesseract could not initialize eng+tel. The OCR data was reset; please try the import again.")
+                    }
+                    // Each card is a block of text; skipping page layout analysis is faster.
+                    engine.setPageSegMode(TessBaseAPI.PageSegMode.PSM_SINGLE_BLOCK)
+                    idle.add(engine)
                 }
+                pool = Executors.newFixedThreadPool(threads)
 
                 pfd = ParcelFileDescriptor.open(pdf, ParcelFileDescriptor.MODE_READ_ONLY)
                 renderer = PdfRenderer(pfd)
@@ -182,44 +193,62 @@ class MainActivity : AppCompatActivity() {
                         val cellHeight = (bottom - top) / 9
                         check(cellWidth > 0 && cellHeight > 0) { "Invalid card grid on PDF page ${pageIndex + 1}" }
 
-                        for (row in 0 until 9) {
-                            for (column in 0 until 3) {
-                                val x = left + column * cellWidth
-                                val y = top + row * cellHeight
-                                val rect = Rect(
-                                    x.coerceAtLeast(0),
-                                    y.coerceAtLeast(0),
-                                    (x + cellWidth).coerceAtMost(bitmap.width),
-                                    (y + cellHeight).coerceAtMost(bitmap.height)
-                                )
-                                if (rect.width() <= 0 || rect.height() <= 0) continue
+                        // Crop all cards of this page, then OCR them in parallel.
+                        val cards = ArrayList<Bitmap>(27)
+                        try {
+                            for (row in 0 until 9) {
+                                for (column in 0 until 3) {
+                                    val x = left + column * cellWidth
+                                    val y = top + row * cellHeight
+                                    val rect = Rect(
+                                        x.coerceAtLeast(0),
+                                        y.coerceAtLeast(0),
+                                        (x + cellWidth).coerceAtMost(bitmap.width),
+                                        (y + cellHeight).coerceAtMost(bitmap.height)
+                                    )
+                                    if (rect.width() <= 0 || rect.height() <= 0) continue
+                                    cards.add(
+                                        Bitmap.createBitmap(bitmap, rect.left, rect.top, rect.width(), rect.height())
+                                    )
+                                }
+                            }
 
-                                val cardBitmap = Bitmap.createBitmap(
-                                    bitmap,
-                                    rect.left,
-                                    rect.top,
-                                    rect.width(),
-                                    rect.height()
-                                )
-                                try {
-                                    engine.setImage(cardBitmap)
-                                    val recognizedText = engine.getUTF8Text().orEmpty()
-                                        .replace(Regex("\\s+"), " ")
-                                        .trim()
+                            val tasks = cards.map { card ->
+                                Callable {
+                                    val engine = idle.take()
+                                    try {
+                                        engine.setImage(card)
+                                        val text = engine.getUTF8Text().orEmpty()
+                                            .replace(Regex("\\s+"), " ")
+                                            .trim()
+                                        engine.clear()
+                                        text
+                                    } finally {
+                                        idle.put(engine)
+                                    }
+                                }
+                            }
+                            val texts = pool!!.invokeAll(tasks).map { it.get() }
 
+                            // Save images and DB rows from this thread, in one transaction per page.
+                            db.writableDatabase.beginTransaction()
+                            try {
+                                for (i in cards.indices) {
                                     serial++
                                     val imageFile = File(cardFolder, "card_$serial.jpg")
                                     FileOutputStream(imageFile).use { output ->
-                                        check(cardBitmap.compress(Bitmap.CompressFormat.JPEG, 82, output)) {
+                                        check(cards[i].compress(Bitmap.CompressFormat.JPEG, 82, output)) {
                                             "Could not save card image $serial"
                                         }
                                     }
-                                    db.insert(serial, pageIndex + 1, recognizedText, imageFile.absolutePath)
-                                    engine.clear()
-                                } finally {
-                                    cardBitmap.recycle()
+                                    db.insert(serial, pageIndex + 1, texts[i], imageFile.absolutePath)
                                 }
+                                db.writableDatabase.setTransactionSuccessful()
+                            } finally {
+                                db.writableDatabase.endTransaction()
                             }
+                        } finally {
+                            cards.forEach { it.recycle() }
                         }
                     } finally {
                         pageBitmap?.recycle()
@@ -250,7 +279,8 @@ class MainActivity : AppCompatActivity() {
             } finally {
                 try { renderer?.close() } catch (_: Exception) { }
                 try { pfd?.close() } catch (_: Exception) { }
-                try { ocr?.recycle() } catch (_: Exception) { }
+                pool?.shutdownNow()
+                engines.forEach { try { it.recycle() } catch (_: Exception) { } }
             }
 
             if (completed) {
